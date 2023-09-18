@@ -102,7 +102,7 @@ struct ConfigFileVsockParam {
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about = None, long_about = None)]
 struct VsockArgs {
     #[command(flatten)]
     param: Option<VsockParam>,
