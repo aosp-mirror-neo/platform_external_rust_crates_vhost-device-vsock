@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use std::{
+    collections::HashSet,
     fs::File,
     io,
     io::Read,
+    iter::FromIterator,
     num::Wrapping,
     ops::Deref,
     os::unix::{
         net::{UnixListener, UnixStream},
         prelude::{AsRawFd, FromRawFd, RawFd},
     },
-    sync::{Arc, RwLock},
+    sync::mpsc::Sender,
+    sync::{mpsc, Arc, RwLock},
+    thread,
 };
 
-use futures::executor::{ThreadPool, ThreadPoolBuilder};
 use log::warn;
 use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
 use virtio_queue::QueueOwnedT;
@@ -40,6 +43,15 @@ enum RxQueueType {
     Standard,
     RawPkts,
 }
+
+// Data which is required by a worker handling event idx.
+struct EventData {
+    vring: VringRwLock,
+    event_idx: bool,
+    head_idx: u16,
+    used_len: usize,
+}
+
 pub(crate) struct VhostUserVsockThread {
     /// Guest memory map.
     pub mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
@@ -59,8 +71,8 @@ pub(crate) struct VhostUserVsockThread {
     pub thread_backend: VsockThreadBackend,
     /// CID of the guest.
     guest_cid: u64,
-    /// Thread pool to handle event idx.
-    pool: ThreadPool,
+    /// Channel to a worker which handles event idx.
+    sender: Sender<EventData>,
     /// host side port on which application listens.
     local_port: Wrapping<u32>,
     /// The tx buffer size
@@ -79,6 +91,7 @@ impl VhostUserVsockThread {
         uds_path: String,
         guest_cid: u64,
         tx_buffer_size: u32,
+        groups: Vec<String>,
         cid_map: Arc<RwLock<CidMap>>,
     ) -> Result<Self> {
         // TODO: better error handling, maybe add a param to force the unlink
@@ -93,6 +106,10 @@ impl VhostUserVsockThread {
 
         let host_raw_fd = host_sock.as_raw_fd();
 
+        let mut groups = groups;
+        let groups_set: Arc<RwLock<HashSet<String>>> =
+            Arc::new(RwLock::new(HashSet::from_iter(groups.drain(..))));
+
         let sibling_event_fd = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
 
         let thread_backend = VsockThreadBackend::new(
@@ -100,17 +117,34 @@ impl VhostUserVsockThread {
             epoll_fd,
             guest_cid,
             tx_buffer_size,
+            groups_set.clone(),
             cid_map.clone(),
         );
 
-        cid_map.write().unwrap().insert(
-            guest_cid,
-            (
-                thread_backend.raw_pkts_queue.clone(),
-                sibling_event_fd.try_clone().unwrap(),
-            ),
-        );
+        {
+            let mut cid_map = cid_map.write().unwrap();
+            if cid_map.contains_key(&guest_cid) {
+                return Err(Error::CidAlreadyInUse);
+            }
 
+            cid_map.insert(
+                guest_cid,
+                (
+                    thread_backend.raw_pkts_queue.clone(),
+                    groups_set,
+                    sibling_event_fd.try_clone().unwrap(),
+                ),
+            );
+        }
+        let (sender, receiver) = mpsc::channel::<EventData>();
+        thread::spawn(move || loop {
+            // TODO: Understand why doing the following in the background thread works.
+            // maybe we'd better have thread pool for the entire application if necessary.
+            let Ok(event_data) = receiver.recv() else {
+                break;
+            };
+            Self::vring_handle_event(event_data);
+        });
         let thread = VhostUserVsockThread {
             mem: None,
             event_idx: false,
@@ -121,10 +155,7 @@ impl VhostUserVsockThread {
             epoll_file,
             thread_backend,
             guest_cid,
-            pool: ThreadPoolBuilder::new()
-                .pool_size(1)
-                .create()
-                .map_err(Error::CreateThreadPool)?,
+            sender,
             local_port: Wrapping(0),
             tx_buffer_size,
             sibling_event_fd,
@@ -136,6 +167,37 @@ impl VhostUserVsockThread {
         Ok(thread)
     }
 
+    fn vring_handle_event(event_data: EventData) {
+        if event_data.event_idx {
+            if event_data
+                .vring
+                .add_used(event_data.head_idx, event_data.used_len as u32)
+                .is_err()
+            {
+                warn!("Could not return used descriptors to ring");
+            }
+            match event_data.vring.needs_notification() {
+                Err(_) => {
+                    warn!("Could not check if queue needs to be notified");
+                    event_data.vring.signal_used_queue().unwrap();
+                }
+                Ok(needs_notification) => {
+                    if needs_notification {
+                        event_data.vring.signal_used_queue().unwrap();
+                    }
+                }
+            }
+        } else {
+            if event_data
+                .vring
+                .add_used(event_data.head_idx, event_data.used_len as u32)
+                .is_err()
+            {
+                warn!("Could not return used descriptors to ring");
+            }
+            event_data.vring.signal_used_queue().unwrap();
+        }
+    }
     /// Register a file with an epoll to listen for events in evset.
     pub fn epoll_register(epoll_fd: RawFd, fd: RawFd, evset: epoll::Events) -> Result<()> {
         epoll::ctl(
@@ -488,31 +550,14 @@ impl VhostUserVsockThread {
 
             let vring = vring.clone();
             let event_idx = self.event_idx;
-
-            self.pool.spawn_ok(async move {
-                // TODO: Understand why doing the following in the pool works
-                if event_idx {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    match vring.needs_notification() {
-                        Err(_) => {
-                            warn!("Could not check if queue needs to be notified");
-                            vring.signal_used_queue().unwrap();
-                        }
-                        Ok(needs_notification) => {
-                            if needs_notification {
-                                vring.signal_used_queue().unwrap();
-                            }
-                        }
-                    }
-                } else {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    vring.signal_used_queue().unwrap();
-                }
-            });
+            self.sender
+                .send(EventData {
+                    vring,
+                    event_idx,
+                    head_idx,
+                    used_len,
+                })
+                .unwrap();
 
             match rx_queue_type {
                 RxQueueType::Standard => {
@@ -645,30 +690,14 @@ impl VhostUserVsockThread {
 
             let vring = vring.clone();
             let event_idx = self.event_idx;
-
-            self.pool.spawn_ok(async move {
-                if event_idx {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    match vring.needs_notification() {
-                        Err(_) => {
-                            warn!("Could not check if queue needs to be notified");
-                            vring.signal_used_queue().unwrap();
-                        }
-                        Ok(needs_notification) => {
-                            if needs_notification {
-                                vring.signal_used_queue().unwrap();
-                            }
-                        }
-                    }
-                } else {
-                    if vring.add_used(head_idx, used_len as u32).is_err() {
-                        warn!("Could not return used descriptors to ring");
-                    }
-                    vring.signal_used_queue().unwrap();
-                }
-            });
+            self.sender
+                .send(EventData {
+                    vring,
+                    event_idx,
+                    head_idx,
+                    used_len,
+                })
+                .unwrap();
         }
 
         Ok(used_any)
@@ -723,6 +752,8 @@ mod tests {
 
     #[test]
     fn test_vsock_thread() {
+        let groups: Vec<String> = vec![String::from("default")];
+
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let test_dir = tempdir().expect("Could not create a temp test directory.");
@@ -735,6 +766,7 @@ mod tests {
                 .to_string(),
             3,
             CONN_TX_BUF_SIZE,
+            groups,
             cid_map,
         );
         assert!(t.is_ok());
@@ -792,6 +824,8 @@ mod tests {
 
     #[test]
     fn test_vsock_thread_failures() {
+        let groups: Vec<String> = vec![String::from("default")];
+
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
         let test_dir = tempdir().expect("Could not create a temp test directory.");
@@ -800,6 +834,7 @@ mod tests {
             "/sys/not_allowed.vsock".to_string(),
             3,
             CONN_TX_BUF_SIZE,
+            groups.clone(),
             cid_map.clone(),
         );
         assert!(t.is_err());
@@ -809,8 +844,14 @@ mod tests {
             .join("test_vsock_thread_failures.vsock")
             .display()
             .to_string();
-        let mut t =
-            VhostUserVsockThread::new(vsock_socket_path, 3, CONN_TX_BUF_SIZE, cid_map).unwrap();
+        let mut t = VhostUserVsockThread::new(
+            vsock_socket_path,
+            3,
+            CONN_TX_BUF_SIZE,
+            groups.clone(),
+            cid_map.clone(),
+        )
+        .unwrap();
         assert!(VhostUserVsockThread::epoll_register(-1, -1, epoll::Events::EPOLLIN).is_err());
         assert!(VhostUserVsockThread::epoll_modify(-1, -1, epoll::Events::EPOLLIN).is_err());
         assert!(VhostUserVsockThread::epoll_unregister(-1, -1).is_err());
@@ -831,6 +872,16 @@ mod tests {
             .push_back(ConnMapKey::new(0, 0));
         assert!(t.process_rx(&vring, false).is_err());
         assert!(t.process_rx(&vring, true).is_err());
+
+        // trying to use a CID that is already in use should fail
+        let vsock_socket_path2 = test_dir
+            .path()
+            .join("test_vsock_thread_failures2.vsock")
+            .display()
+            .to_string();
+        let t2 =
+            VhostUserVsockThread::new(vsock_socket_path2, 3, CONN_TX_BUF_SIZE, groups, cid_map);
+        assert!(t2.is_err());
 
         test_dir.close().unwrap();
     }
