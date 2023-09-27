@@ -27,6 +27,7 @@ use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
 const DEFAULT_GUEST_CID: u64 = 3;
 const DEFAULT_TX_BUFFER_SIZE: u32 = 64 * 1024;
+const DEFAULT_GROUP_NAME: &str = "default";
 
 #[derive(Debug, ThisError)]
 enum CliError {
@@ -56,7 +57,7 @@ enum BackendError {
     CouldNotCreateDaemon(vhost_user_backend::Error),
 }
 
-#[derive(Args, Clone, Debug, Deserialize)]
+#[derive(Args, Clone, Debug)]
 struct VsockParam {
     /// Context identifier of the guest which uniquely identifies the device for its lifetime.
     #[arg(
@@ -78,6 +79,26 @@ struct VsockParam {
     /// The size of the buffer used for the TX virtqueue
     #[clap(long, default_value_t = DEFAULT_TX_BUFFER_SIZE, conflicts_with = "config", conflicts_with = "vm")]
     tx_buffer_size: u32,
+
+    /// The list of group names to which the device belongs.
+    /// A group is a set of devices that allow sibling communication between their guests.
+    #[arg(
+        long,
+        default_value_t = String::from(DEFAULT_GROUP_NAME),
+        conflicts_with = "config",
+        conflicts_with = "vm",
+        verbatim_doc_comment
+    )]
+    groups: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ConfigFileVsockParam {
+    guest_cid: Option<u64>,
+    socket: String,
+    uds_path: String,
+    tx_buffer_size: Option<u32>,
+    groups: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -87,8 +108,9 @@ struct VsockArgs {
     param: Option<VsockParam>,
 
     /// Device parameters corresponding to a VM in the form of comma separated key=value pairs.
-    /// The allowed keys are: guest_cid, socket, uds_path and tx_buffer_size
-    /// Example: --vm guest-cid=3,socket=/tmp/vhost3.socket,uds-path=/tmp/vm3.vsock,tx-buffer-size=65536
+    /// The allowed keys are: guest_cid, socket, uds_path, tx_buffer_size and group.
+    /// Example:
+    ///   --vm guest-cid=3,socket=/tmp/vhost3.socket,uds-path=/tmp/vm3.vsock,tx-buffer-size=65536,groups=group1+group2
     /// Multiple instances of this argument can be provided to configure devices for multiple guests.
     #[arg(long, conflicts_with = "config", verbatim_doc_comment, value_parser = parse_vm_params)]
     vm: Option<Vec<VsockConfig>>,
@@ -103,6 +125,7 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
     let mut socket = None;
     let mut uds_path = None;
     let mut tx_buffer_size = None;
+    let mut groups = None;
 
     for arg in s.trim().split(',') {
         let mut parts = arg.split('=');
@@ -118,6 +141,7 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
             "tx_buffer_size" | "tx-buffer-size" => {
                 tx_buffer_size = Some(val.parse().map_err(VmArgsParseError::ParseInteger)?)
             }
+            "groups" => groups = Some(val.split('+').map(String::from).collect()),
             _ => return Err(VmArgsParseError::InvalidKey(key.to_string())),
         }
     }
@@ -127,6 +151,7 @@ fn parse_vm_params(s: &str) -> Result<VsockConfig, VmArgsParseError> {
         socket.ok_or_else(|| VmArgsParseError::RequiredKeyNotFound("socket".to_string()))?,
         uds_path.ok_or_else(|| VmArgsParseError::RequiredKeyNotFound("uds-path".to_string()))?,
         tx_buffer_size.unwrap_or(DEFAULT_TX_BUFFER_SIZE),
+        groups.unwrap_or(vec![DEFAULT_GROUP_NAME.to_string()]),
     ))
 }
 
@@ -137,16 +162,19 @@ impl VsockArgs {
                 .add_source(config::File::new(c.as_str(), config::FileFormat::Yaml))
                 .build();
             if let Ok(s) = b {
-                let mut v = s.get::<Vec<VsockParam>>("vms").unwrap();
+                let mut v = s.get::<Vec<ConfigFileVsockParam>>("vms").unwrap();
                 if !v.is_empty() {
                     let parsed: Vec<VsockConfig> = v
                         .drain(..)
                         .map(|p| {
                             VsockConfig::new(
-                                p.guest_cid,
+                                p.guest_cid.unwrap_or(DEFAULT_GUEST_CID),
                                 p.socket.trim().to_string(),
                                 p.uds_path.trim().to_string(),
-                                p.tx_buffer_size,
+                                p.tx_buffer_size.unwrap_or(DEFAULT_TX_BUFFER_SIZE),
+                                p.groups.map_or(vec![DEFAULT_GROUP_NAME.to_string()], |g| {
+                                    g.trim().split('+').map(String::from).collect()
+                                }),
                             )
                         })
                         .collect();
@@ -177,6 +205,7 @@ impl TryFrom<VsockArgs> for Vec<VsockConfig> {
                         p.socket.trim().to_string(),
                         p.uds_path.trim().to_string(),
                         p.tx_buffer_size,
+                        p.groups.trim().split('+').map(String::from).collect(),
                     )])
                 }),
             },
@@ -281,13 +310,20 @@ mod tests {
     use tempfile::tempdir;
 
     impl VsockArgs {
-        fn from_args(guest_cid: u64, socket: &str, uds_path: &str, tx_buffer_size: u32) -> Self {
+        fn from_args(
+            guest_cid: u64,
+            socket: &str,
+            uds_path: &str,
+            tx_buffer_size: u32,
+            groups: &str,
+        ) -> Self {
             VsockArgs {
                 param: Some(VsockParam {
                     guest_cid,
                     socket: socket.to_string(),
                     uds_path: uds_path.to_string(),
                     tx_buffer_size,
+                    groups: groups.to_string(),
                 }),
                 vm: None,
                 config: None,
@@ -308,7 +344,7 @@ mod tests {
 
         let socket_path = test_dir.path().join("vhost4.socket").display().to_string();
         let uds_path = test_dir.path().join("vm4.vsock").display().to_string();
-        let args = VsockArgs::from_args(3, &socket_path, &uds_path, 64 * 1024);
+        let args = VsockArgs::from_args(3, &socket_path, &uds_path, 64 * 1024, "group1");
 
         let configs = Vec::<VsockConfig>::try_from(args);
         assert!(configs.is_ok());
@@ -321,6 +357,7 @@ mod tests {
         assert_eq!(config.get_socket_path(), socket_path);
         assert_eq!(config.get_uds_path(), uds_path);
         assert_eq!(config.get_tx_buffer_size(), 64 * 1024);
+        assert_eq!(config.get_groups(), vec!["group1".to_string()]);
 
         test_dir.close().unwrap();
     }
@@ -341,8 +378,8 @@ mod tests {
         ];
         let params = format!(
             "--vm socket={vhost3_socket},uds_path={vm3_vsock} \
-             --vm socket={vhost4_socket},uds-path={vm4_vsock},guest-cid=4,tx_buffer_size=65536 \
-             --vm guest-cid=5,socket={vhost5_socket},uds_path={vm5_vsock},tx-buffer-size=32768",
+             --vm socket={vhost4_socket},uds-path={vm4_vsock},guest-cid=4,tx_buffer_size=65536,groups=group1 \
+             --vm groups=group2+group3,guest-cid=5,socket={vhost5_socket},uds_path={vm5_vsock},tx-buffer-size=32768",
             vhost3_socket = socket_paths[0].display(),
             vhost4_socket = socket_paths[1].display(),
             vhost5_socket = socket_paths[2].display(),
@@ -370,6 +407,7 @@ mod tests {
         );
         assert_eq!(config.get_uds_path(), uds_paths[0].display().to_string());
         assert_eq!(config.get_tx_buffer_size(), 65536);
+        assert_eq!(config.get_groups(), vec![DEFAULT_GROUP_NAME.to_string()]);
 
         let config = configs.get(1).unwrap();
         assert_eq!(config.get_guest_cid(), 4);
@@ -379,6 +417,7 @@ mod tests {
         );
         assert_eq!(config.get_uds_path(), uds_paths[1].display().to_string());
         assert_eq!(config.get_tx_buffer_size(), 65536);
+        assert_eq!(config.get_groups(), vec!["group1".to_string()]);
 
         let config = configs.get(2).unwrap();
         assert_eq!(config.get_guest_cid(), 5);
@@ -388,6 +427,10 @@ mod tests {
         );
         assert_eq!(config.get_uds_path(), uds_paths[2].display().to_string());
         assert_eq!(config.get_tx_buffer_size(), 32768);
+        assert_eq!(
+            config.get_groups(),
+            vec!["group2".to_string(), "group3".to_string()]
+        );
 
         test_dir.close().unwrap();
     }
@@ -407,7 +450,8 @@ mod tests {
     - guest_cid: 4
       socket: {}
       uds_path: {}
-      tx_buffer_size: 65536",
+      tx_buffer_size: 32768
+      groups: group1+group2",
                 socket_path.display(),
                 uds_path.display(),
             )
@@ -423,8 +467,38 @@ mod tests {
         assert_eq!(config.get_guest_cid(), 4);
         assert_eq!(config.get_socket_path(), socket_path.display().to_string());
         assert_eq!(config.get_uds_path(), uds_path.display().to_string());
-        std::fs::remove_file(&config_path).unwrap();
+        assert_eq!(config.get_tx_buffer_size(), 32768);
+        assert_eq!(
+            config.get_groups(),
+            vec!["group1".to_string(), "group2".to_string()]
+        );
 
+        // Now test that optional parameters are correctly set to their default values.
+        let mut yaml = File::create(&config_path).unwrap();
+        yaml.write_all(
+            format!(
+                "vms:
+    - socket: {}
+      uds_path: {}",
+                socket_path.display(),
+                uds_path.display(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let args = VsockArgs::from_file(&config_path.display().to_string());
+
+        let configs = Vec::<VsockConfig>::try_from(args).unwrap();
+        assert_eq!(configs.len(), 1);
+
+        let config = &configs[0];
+        assert_eq!(config.get_guest_cid(), DEFAULT_GUEST_CID);
+        assert_eq!(config.get_socket_path(), socket_path.display().to_string());
+        assert_eq!(config.get_uds_path(), uds_path.display().to_string());
+        assert_eq!(config.get_tx_buffer_size(), DEFAULT_TX_BUFFER_SIZE);
+        assert_eq!(config.get_groups(), vec![DEFAULT_GROUP_NAME.to_string()]);
+
+        std::fs::remove_file(&config_path).unwrap();
         test_dir.close().unwrap();
     }
 
@@ -446,7 +520,13 @@ mod tests {
             .display()
             .to_string();
 
-        let config = VsockConfig::new(CID, vhost_socket_path, vsock_socket_path, CONN_TX_BUF_SIZE);
+        let config = VsockConfig::new(
+            CID,
+            vhost_socket_path,
+            vsock_socket_path,
+            CONN_TX_BUF_SIZE,
+            vec![DEFAULT_GROUP_NAME.to_string()],
+        );
 
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
 
