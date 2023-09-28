@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 or BSD-3-Clause
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Result as IoResult},
     sync::{Arc, Mutex, RwLock},
     u16, u32, u64, u8,
@@ -24,9 +24,10 @@ use vmm_sys_util::{
 use crate::thread_backend::RawPktsQ;
 use crate::vhu_vsock_thread::*;
 
-pub(crate) type CidMap = HashMap<u64, (Arc<RwLock<RawPktsQ>>, EventFd)>;
+pub(crate) type CidMap =
+    HashMap<u64, (Arc<RwLock<RawPktsQ>>, Arc<RwLock<HashSet<String>>>, EventFd)>;
 
-const NUM_QUEUES: usize = 2;
+const NUM_QUEUES: usize = 3;
 const QUEUE_SIZE: usize = 256;
 
 // New descriptors pending on the rx queue
@@ -37,10 +38,12 @@ const TX_QUEUE_EVENT: u16 = 1;
 const EVT_QUEUE_EVENT: u16 = 2;
 
 /// Notification coming from the backend.
-pub(crate) const BACKEND_EVENT: u16 = 3;
+/// Event range [0...num_queues] is reserved for queues and exit event.
+/// So NUM_QUEUES + 1 is used.
+pub(crate) const BACKEND_EVENT: u16 = (NUM_QUEUES + 1) as u16;
 
 /// Notification coming from the sibling VM.
-pub(crate) const SIBLING_VM_EVENT: u16 = 4;
+pub(crate) const SIBLING_VM_EVENT: u16 = BACKEND_EVENT + 1;
 
 /// CID of the host
 pub(crate) const VSOCK_HOST_CID: u64 = 2;
@@ -112,8 +115,6 @@ pub(crate) enum Error {
     IterateQueue,
     #[error("No rx request available")]
     NoRequestRx,
-    #[error("Unable to create thread pool")]
-    CreateThreadPool(std::io::Error),
     #[error("Packet missing data buffer")]
     PktBufMissing,
     #[error("Failed to connect to unix socket")]
@@ -132,6 +133,8 @@ pub(crate) enum Error {
     EventFdCreate(std::io::Error),
     #[error("Raw vsock packets queue is empty")]
     EmptyRawPktsQueue,
+    #[error("CID already in use by another vsock device")]
+    CidAlreadyInUse,
 }
 
 impl std::convert::From<Error> for std::io::Error {
@@ -148,17 +151,25 @@ pub(crate) struct VsockConfig {
     socket: String,
     uds_path: String,
     tx_buffer_size: u32,
+    groups: Vec<String>,
 }
 
 impl VsockConfig {
     /// Create a new instance of the VsockConfig struct, containing the
     /// parameters to be fed into the vsock-backend server.
-    pub fn new(guest_cid: u64, socket: String, uds_path: String, tx_buffer_size: u32) -> Self {
+    pub fn new(
+        guest_cid: u64,
+        socket: String,
+        uds_path: String,
+        tx_buffer_size: u32,
+        groups: Vec<String>,
+    ) -> Self {
         Self {
             guest_cid,
             socket,
             uds_path,
             tx_buffer_size,
+            groups,
         }
     }
 
@@ -181,6 +192,10 @@ impl VsockConfig {
 
     pub fn get_tx_buffer_size(&self) -> u32 {
         self.tx_buffer_size
+    }
+
+    pub fn get_groups(&self) -> Vec<String> {
+        self.groups.clone()
     }
 }
 
@@ -225,6 +240,7 @@ impl VhostUserVsockBackend {
             config.get_uds_path(),
             config.get_guest_cid(),
             config.get_tx_buffer_size(),
+            config.get_groups(),
             cid_map,
         )?);
         let queues_per_thread = vec![QUEUE_MASK];
@@ -295,7 +311,9 @@ impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
             TX_QUEUE_EVENT => {
                 thread.process_tx(vring_tx, evt_idx)?;
             }
-            EVT_QUEUE_EVENT => {}
+            EVT_QUEUE_EVENT => {
+                warn!("Received an unexpected EVT_QUEUE_EVENT");
+            }
             BACKEND_EVENT => {
                 thread.process_backend_evt(evset);
                 if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
@@ -360,6 +378,8 @@ mod tests {
     fn test_vsock_backend() {
         const CID: u64 = 3;
 
+        let groups_list: Vec<String> = vec![String::from("default")];
+
         let test_dir = tempdir().expect("Could not create a temp test directory.");
 
         let vhost_socket_path = test_dir
@@ -378,6 +398,7 @@ mod tests {
             vhost_socket_path.to_string(),
             vsock_socket_path.to_string(),
             CONN_TX_BUF_SIZE,
+            groups_list,
         );
 
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -447,6 +468,8 @@ mod tests {
     fn test_vsock_backend_failures() {
         const CID: u64 = 3;
 
+        let groups: Vec<String> = vec![String::from("default")];
+
         let test_dir = tempdir().expect("Could not create a temp test directory.");
 
         let vhost_socket_path = test_dir
@@ -465,6 +488,7 @@ mod tests {
             "/sys/not_allowed.socket".to_string(),
             "/sys/not_allowed.vsock".to_string(),
             CONN_TX_BUF_SIZE,
+            groups.clone(),
         );
 
         let cid_map: Arc<RwLock<CidMap>> = Arc::new(RwLock::new(HashMap::new()));
@@ -477,6 +501,7 @@ mod tests {
             vhost_socket_path.to_string(),
             vsock_socket_path.to_string(),
             CONN_TX_BUF_SIZE,
+            groups,
         );
 
         let backend = VhostUserVsockBackend::new(config, cid_map).unwrap();
