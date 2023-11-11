@@ -1,8 +1,0 @@
-{
-  "run": true,
-  "dep-suffixes": {
-    "config": "_rust",
-    "vhost": "_android",
-    "vm_memory": "_android"
-  }
-}
