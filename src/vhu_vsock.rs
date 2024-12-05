@@ -256,9 +256,7 @@ impl VhostUserVsockBackend {
     }
 }
 
-impl VhostUserBackend for VhostUserVsockBackend {
-    type Vring = VringRwLock;
-    type Bitmap = ();
+impl VhostUserBackend<VringRwLock, ()> for VhostUserVsockBackend {
     fn num_queues(&self) -> usize {
         NUM_QUEUES
     }
@@ -297,7 +295,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
         evset: EventSet,
         vrings: &[VringRwLock],
         thread_id: usize,
-    ) -> IoResult<()> {
+    ) -> IoResult<bool> {
         let vring_rx = &vrings[0];
         let vring_tx = &vrings[1];
 
@@ -330,7 +328,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
             SIBLING_VM_EVENT => {
                 let _ = thread.sibling_event_fd.read();
                 thread.process_raw_pkts(vring_rx, evt_idx)?;
-                return Ok(());
+                return Ok(false);
             }
             _ => {
                 return Err(Error::HandleUnknownEvent.into());
@@ -341,7 +339,7 @@ impl VhostUserBackend for VhostUserVsockBackend {
             thread.process_rx(vring_rx, evt_idx)?;
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
