@@ -242,7 +242,7 @@ impl VhostUserVsockThread {
     /// Register our listeners in the VringEpollHandler
     pub fn register_listeners(
         &mut self,
-        epoll_handler: Arc<VringEpollHandler<ArcVhostBknd>>,
+        epoll_handler: Arc<VringEpollHandler<ArcVhostBknd, VringRwLock, ()>>,
     ) {
         epoll_handler
             .register_listener(self.get_epoll_fd(), EventSet::IN, u64::from(BACKEND_EVENT))
